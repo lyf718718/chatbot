@@ -1,259 +1,182 @@
 import streamlit as st
 import pandas as pd
 import re
-import io
+from io import StringIO
 
 # -------------------------------------------------
-#  Streamlit Dictionary Classification Bot
+# Streamlit Dictionary Classification Bot (v1.1)
 # -------------------------------------------------
-#  A Python conversion of the original React app
-#  for interactive dictionary‑based text classification
+# Robust to messy ground‑truth values such as "#REF!",
+# non‑numeric labels ("yes"/"no"), missing data, etc.
 # -------------------------------------------------
 
-st.set_page_config(page_title="Dictionary Classification Bot", layout="wide")
+# ---------- Helper functions --------------------------------------------------
 
-# ------------------
-# Helper functions
-# ------------------
-
-def escape_regex(token: str) -> str:
-    """Escape special regex characters in a keyword."""
-    return re.sub(r"[.*+?^${}()|[\]\\]", lambda m: f"\\{m.group(0)}", token)
+def safe_regex(keyword: str) -> re.Pattern:
+    """Return a compiled word‑boundary regex for a keyword."""
+    return re.compile(r"\b" + re.escape(keyword.lower()) + r"\b")
 
 
-def safe_regex(keyword: str):
-    return re.compile(rf"\b{escape_regex(keyword.lower())}\b")
+def compile_dictionary(keywords):
+    """Pre‑compile regex patterns for faster matching."""
+    return [safe_regex(kw) for kw in keywords]
 
 
-def parse_csv(text: str) -> pd.DataFrame:
-    """Read CSV text into a DataFrame."""
-    return pd.read_csv(io.StringIO(text))
+def parse_gt(value):
+    """Parse ground‑truth to 0/1 or return None when unparsable."""
+    if pd.isna(value):
+        return None
+
+    # Handle common spreadsheet errors like '#REF!' gracefully
+    val_str = str(value).strip().lower()
+
+    # Map typical booleans / labels → ints
+    truthy = {"1", "true", "yes", "y", "t"}
+    falsy = {"0", "false", "no", "n", "f"}
+
+    if val_str in truthy:
+        return 1
+    if val_str in falsy:
+        return 0
+
+    # Try numeric conversion last
+    try:
+        return int(float(val_str))
+    except ValueError:
+        return None  # Leave as missing if still invalid
 
 
-def classify(df: pd.DataFrame, text_col: str, gt_col: str | None, dictionary: list[str]):
-    """Run keyword‑based classification and compute metrics."""
-    rows = []
-    tp = fp = tn = fn = 0
+def classify(df, text_col, gt_col, dictionary):
+    """Run dictionary classification and compute basic metrics."""
+    compiled_dict = compile_dictionary(dictionary)
+    records = []
 
     for _, row in df.iterrows():
-        statement = str(row[text_col]).lower()
-        matched = [kw for kw in dictionary if safe_regex(kw).search(statement)]
-        pred = int(bool(matched))
-        gt = int(row[gt_col]) if gt_col else None
+        text = str(row[text_col])
+        pred = int(any(p.search(text.lower()) for p in compiled_dict))
 
-        category = None
-        if gt_col:
-            if pred == 1 and gt == 1:
-                tp += 1
-                category = "TP"
-            elif pred == 1 and gt == 0:
-                fp += 1
-                category = "FP"
-            elif pred == 0 and gt == 1:
-                fn += 1
-                category = "FN"
-            else:
-                tn += 1
-                category = "TN"
+        gt = parse_gt(row[gt_col]) if gt_col else None
 
-        rows.append(
-            {
-                "statement": row[text_col],
-                "predicted": pred,
-                "ground_truth": gt,
-                "category": category,
-                "matched_keywords": ", ".join(matched),
-            }
-        )
+        # Categorize for error analysis
+        if gt is None:
+            category = "Ungraded"
+        elif pred == 1 and gt == 1:
+            category = "TP"
+        elif pred == 1 and gt == 0:
+            category = "FP"
+        elif pred == 0 and gt == 1:
+            category = "FN"
+        else:
+            category = "TN"
 
-    res_df = pd.DataFrame(rows)
+        records.append({
+            "text": row[text_col],
+            "pred": pred,
+            "gt": gt,
+            "category": category,
+        })
 
-    metrics = None
+    res_df = pd.DataFrame(records)
+
+    # --- Metrics (skip rows with missing GT) ------------------------
     if gt_col:
-        precision = tp / (tp + fp) if (tp + fp) else 0
-        recall = tp / (tp + fn) if (tp + fn) else 0
-        f1 = 2 * precision * recall / (precision + recall) if precision and recall else 0
-        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else 0
+        eval_df = res_df.dropna(subset=["gt"])
+        tp = ((eval_df.pred == 1) & (eval_df.gt == 1)).sum()
+        fp = ((eval_df.pred == 1) & (eval_df.gt == 0)).sum()
+        fn = ((eval_df.pred == 0) & (eval_df.gt == 1)).sum()
+        tn = ((eval_df.pred == 0) & (eval_df.gt == 0)).sum()
+
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = (2 * precision * recall) / (precision + recall) if precision + recall else 0.0
+        accuracy = (tp + tn) / len(eval_df) if len(eval_df) else 0.0
+
         metrics = {
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "TP": tp,
-            "FP": fp,
-            "FN": fn,
-            "TN": tn,
+            "accuracy": round(accuracy, 4),
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "support": int(len(eval_df)),
         }
+    else:
+        metrics = {}
 
     return res_df, metrics
 
 
-def keyword_impact(df: pd.DataFrame, text_col: str, gt_col: str, dictionary: list[str]):
-    """Compute recall, precision & F1 for each keyword (top‑10 by metric)."""
-    impact = []
-    for kw in dictionary:
-        regex = safe_regex(kw)
-        tp = fp = pos_total = 0
-        tp_examples, fp_examples = [], []
+# ---------- Streamlit UI ------------------------------------------------------
 
-        for _, row in df.iterrows():
-            contains = bool(regex.search(str(row[text_col]).lower()))
-            gt = int(row[gt_col])
-            if gt == 1:
-                pos_total += 1
-                if contains:
-                    tp += 1
-                    if len(tp_examples) < 3:
-                        tp_examples.append(row[text_col])
-            elif gt == 0 and contains:
-                fp += 1
-                if len(fp_examples) < 3:
-                    fp_examples.append(row[text_col])
+st.set_page_config(page_title="Dictionary Classifier", layout="wide")
 
-        recall = tp / pos_total if pos_total else 0
-        precision = tp / (tp + fp) if (tp + fp) else 0
-        f1 = 2 * precision * recall / (precision + recall) if precision and recall else 0
+st.title("📚 Dictionary Classification Bot")
+st.write("Upload text data and quickly test a keyword dictionary. Now survives spreadsheet oddities like **#REF!** in the ground‑truth column.")
 
-        impact.append(
-            {
-                "keyword": kw,
-                "recall": recall,
-                "precision": precision,
-                "f1": f1,
-                "tp": tp,
-                "fp": fp,
-                "tp_examples": tp_examples,
-                "fp_examples": fp_examples,
-            }
+# 1. Data upload / preview ------------------------------------------------------
+
+uploaded_file = st.file_uploader("Step 1 – Upload a CSV file", type=["csv"])  # noqa: E501
+
+if uploaded_file:
+    df_raw = pd.read_csv(uploaded_file)
+    st.success(f"Loaded **{len(df_raw):,}** rows.")
+    st.dataframe(df_raw.head(), use_container_width=True, height=150)
+
+    text_col = st.selectbox("Step 2 – Choose the text column", df_raw.columns)
+    gt_options = ["<None>"] + df_raw.columns.tolist()
+    gt_col = st.selectbox("Ground‑truth column (optional)", gt_options)
+else:
+    df_raw = None
+    text_col = None
+    gt_col = "<None>"
+
+# 2. Dictionary input -----------------------------------------------------------
+
+st.subheader("Step 3 – Enter keywords (one per line)")
+initial = """custom
+bespoke
+made‑to‑measure""" if not st.session_state.get("seeded") else ""
+
+keywords_text = st.text_area("Keywords", value=initial, height=150)
+keywords = [kw.strip() for kw in keywords_text.splitlines() if kw.strip()]
+
+# 3. Classification -------------------------------------------------------------
+
+if st.button("🚀 Classify statements"):
+    if df_raw is None or not text_col or not keywords:
+        st.error("Please upload data, choose a text column, and enter at least one keyword.")
+    else:
+        res_df, metrics = classify(
+            df_raw,
+            text_col,
+            None if gt_col == "<None>" else gt_col,
+            keywords,
         )
 
-    top_by_recall = sorted(impact, key=lambda d: d["recall"], reverse=True)[:10]
-    top_by_precision = sorted(impact, key=lambda d: d["precision"], reverse=True)[:10]
-    top_by_f1 = sorted(impact, key=lambda d: d["f1"], reverse=True)[:10]
+        # Save in session_state for follow‑on analysis
+        st.session_state["results"] = res_df
+        st.session_state["metrics"] = metrics
 
-    return {
-        "recall": top_by_recall,
-        "precision": top_by_precision,
-        "f1": top_by_f1,
-    }
+        st.subheader("Results")
+        if metrics:
+            st.write(metrics)
+        st.dataframe(res_df.head(50), use_container_width=True)
 
+        # Download link
+        csv = res_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download full results as CSV", csv, "dictionary_classification_results.csv", "text/csv")
 
-# ------------------
-# Sample CSV (same as React demo)
-# ------------------
-SAMPLE_CSV = """ID,Statement,Answer
-1,"It's SPRING TRUNK SHOW week!",1
-2,"I am offering 4 shirts styled the way you want and the 5th is using MAGNETIC COLLAR STAY to help keep your collars in place!",1
-3,"In recognition of Earth Day, I would like to showcase our collection of Earth Fibers!",0
-4,"It is now time to do some wardrobe crunches, and check your basics! Never on sale.",1
-5,"He's a hard worker and always willing to lend a hand. The prices are the best I've seen in 17 years of servicing my clients.",0
-"""
+# 4. Keyword impact analysis ----------------------------------------------------
 
-
-# =================================================
-# UI LAYOUT
-# =================================================
-
-st.title("Dictionary Classification Bot")
-
-# -- STEP 1 : Load data ------------------------------------------------------
-with st.expander("① Upload or paste CSV data"):
-    uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
-    csv_text = st.text_area("…or paste CSV content here", height=150)
-    if st.button("Load sample CSV"):
-        csv_text = SAMPLE_CSV
-        st.session_state["csv_text"] = csv_text
-
-    if uploaded_file is not None:
-        df_raw = pd.read_csv(uploaded_file)
-    elif csv_text:
-        df_raw = parse_csv(csv_text)
-    else:
-        df_raw = None
-
-    if df_raw is not None:
-        st.success(f"Loaded {len(df_raw)} rows.")
-        st.dataframe(df_raw.head())
-
-# -- STEP 2 : Select columns --------------------------------------------------
-if df_raw is not None:
-    columns = df_raw.columns.tolist()
-    text_col = st.selectbox("Text column for analysis", columns, index=columns.index("Statement") if "Statement" in columns else 0)
-    gt_col = st.selectbox("Ground‑truth column (optional, 0/1)", ["None"] + columns, index=(columns.index("Answer") + 1) if "Answer" in columns else 0)
-    gt_col = None if gt_col == "None" else gt_col
-else:
-    text_col = gt_col = None
-
-# -- STEP 3 : Dictionary ------------------------------------------------------
-with st.expander("② Enter / edit keyword dictionary"):
-    dict_text = st.text_area('Keywords (comma‑separated or "word1","word2")', height=100)
-    if st.button("Save dictionary"):
-        kw_in_quotes = re.findall(r'"([^"]+)"', dict_text)
-        keywords = kw_in_quotes or [k.strip() for k in dict_text.split(",")]
-        keywords = [k for k in keywords if k]
-        st.session_state["dictionary"] = keywords
-
-    if "dictionary" in st.session_state:
-        st.markdown(f"**{len(st.session_state['dictionary'])} keywords:** {', '.join(st.session_state['dictionary'])}")
-
-# -- STEP 4 : Classification --------------------------------------------------
-if st.button("③ Classify statements") and df_raw is not None and text_col and st.session_state.get("dictionary"):
-    result_df, metrics = classify(df_raw, text_col, gt_col, st.session_state["dictionary"])
-    st.session_state["results"] = result_df
-    st.session_state["metrics"] = metrics
-
-# -- Display results ----------------------------------------------------------
-if "metrics" in st.session_state and st.session_state["metrics"]:
-    m = st.session_state["metrics"]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Accuracy", f"{m['accuracy']*100:.2f}%")
-    c2.metric("Precision", f"{m['precision']*100:.2f}%")
-    c3.metric("Recall", f"{m['recall']*100:.2f}%")
-    c4.metric("F1 Score", f"{m['f1']*100:.2f}%")
-
-    st.write(f"TP: {m['TP']} | FP: {m['FP']} | FN: {m['FN']} | TN: {m['TN']}")
-
+if "results" in st.session_state and st.button("🔍 Analyze keyword impact"):
     res_df = st.session_state["results"]
-    fp_df = res_df[res_df["category"] == "FP"]
-    fn_df = res_df[res_df["category"] == "FN"]
+    # Build per‑keyword recall table
+    impact = []
+    for kw in keywords:
+        pattern = safe_regex(kw)
+        matched = res_df[res_df.text.str.lower().str.contains(pattern)]
+        gt_available = matched.dropna(subset=["gt"])
+        tp = ((gt_available.pred == 1) & (gt_available.gt == 1)).sum()
+        recall = tp / ((res_df.gt == 1).sum() or 1)
+        impact.append({"keyword": kw, "match_count": len(matched), "recall": round(recall, 4)})
 
-    with st.expander(f"False Positives ({len(fp_df)})"):
-        st.table(fp_df[["statement", "matched_keywords"]].head(50))
-
-    with st.expander(f"False Negatives ({len(fn_df)})"):
-        st.table(fn_df[["statement"]].head(50))
-
-    # -- Keyword impact ------------------------------------------------------
-    if gt_col:
-        if st.button("④ Analyze keyword impact"):
-            analysis = keyword_impact(res_df, "statement", "ground_truth", st.session_state["dictionary"])
-            st.session_state["analysis"] = analysis
-
-# -- Display keyword impact ---------------------------------------------------
-if "analysis" in st.session_state:
-    analysis = st.session_state["analysis"]
-    metric_choice = st.selectbox("Sort top‑10 by", ["recall", "precision", "f1"], key="metric_choice")
-    top_list = analysis[metric_choice]
-
-    st.subheader(f"Top 10 keywords by {metric_choice}")
-    display_df = pd.DataFrame(
-        [
-            {
-                "Keyword": d["keyword"],
-                "Recall %": d["recall"] * 100,
-                "Precision %": d["precision"] * 100,
-                "F1 %": d["f1"] * 100,
-                "True Pos": d["tp"],
-                "False Pos": d["fp"],
-            }
-            for d in top_list
-        ]
-    )
-    st.table(display_df)
-
-    # Download button
-    csv_buf = io.StringIO()
-    display_df.to_csv(csv_buf, index=False)
-    st.download_button(
-        "Download CSV", csv_buf.getvalue(), file_name="keyword_impact.csv", mime="text/csv"
-    )
+    impact_df = pd.DataFrame(impact).sort_values("recall", ascending=False)
+    st.dataframe(impact_df, use_container_width=True)
